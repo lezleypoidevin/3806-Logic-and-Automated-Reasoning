@@ -1,0 +1,345 @@
+"""
+parser.py - First-Order Logic Formula Parser
+
+Supported syntax:
+    Connectives : & (and), | (or), -> (implies), ~ (not)
+    Quantifiers : forall x. F,  exists x. F
+    Atoms       : predicate(term, term, ...) or predicate (0-ary)
+    Terms       : variables / constants (lowercase identifiers), functions f(t,...)
+    Top / Bot   : T (true), F (false)
+
+One formula per line when reading from file. Lines beginning with '#' are comments.
+
+Grammar:
+    formula  ::= quant | implies
+    quant    ::= ('forall' | 'exists') VAR '.' formula
+    implies  ::= or ('->' or)*
+    or       ::= and ('|' and)*
+    and      ::= neg ('&' neg)*
+    neg      ::= '~' neg | atom
+    atom     ::= 'T' | 'F' | NAME ('(' termlist ')')? | '(' formula ')'
+    termlist ::= term (',' term)*
+    term     ::= NAME ('(' termlist ')')?
+"""
+
+import re
+from dataclasses import dataclass
+from typing import List, Optional
+
+
+# ---------------------------------------------------------------------------
+# AST Nodes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Top:
+    """Logical true (T)."""
+    def __repr__(self): return "T"
+
+@dataclass
+class Bot:
+    """Logical false (F)."""
+    def __repr__(self): return "F"
+
+@dataclass
+class Var:
+    """A term: variable or constant."""
+    name: str
+    def __repr__(self): return self.name
+
+@dataclass
+class Func:
+    """A function symbol applied to term arguments."""
+    name: str
+    args: List
+    def __repr__(self):
+        if not self.args:
+            return self.name
+        return f"{self.name}({', '.join(map(repr, self.args))})"
+
+@dataclass
+class Atom:
+    """A predicate applied to term arguments."""
+    name: str
+    args: List
+    def __repr__(self):
+        if not self.args:
+            return self.name
+        return f"{self.name}({', '.join(map(repr, self.args))})"
+
+@dataclass
+class Not:
+    formula: object
+    def __repr__(self): return f"~{self.formula!r}"
+
+@dataclass
+class And:
+    left: object
+    right: object
+    def __repr__(self): return f"({self.left!r} & {self.right!r})"
+
+@dataclass
+class Or:
+    left: object
+    right: object
+    def __repr__(self): return f"({self.left!r} | {self.right!r})"
+
+@dataclass
+class Implies:
+    left: object
+    right: object
+    def __repr__(self): return f"({self.left!r} -> {self.right!r})"
+
+@dataclass
+class Forall:
+    var: str
+    formula: object
+    def __repr__(self): return f"forall {self.var}. {self.formula!r}"
+
+@dataclass
+class Exists:
+    var: str
+    formula: object
+    def __repr__(self): return f"exists {self.var}. {self.formula!r}"
+
+
+# ---------------------------------------------------------------------------
+# Tokeniser
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(
+    r'\s*(?:'
+    r'(->)'                       # implication arrow (must come before '-')
+    r'|([&|~().,])'               # single-character punctuation
+    r'|([A-Za-z_][A-Za-z0-9_]*)' # identifier
+    r')\s*'
+)
+
+def _tokenise(text: str) -> List[str]:
+    tokens = []
+    pos = 0
+    while pos < len(text):
+        m = _TOKEN_RE.match(text, pos)
+        if not m:
+            pos += 1
+            continue
+        tok = m.group(1) or m.group(2) or m.group(3)
+        tokens.append(tok)
+        pos = m.end()
+    return tokens
+
+
+# ---------------------------------------------------------------------------
+# Recursive-descent parser
+# ---------------------------------------------------------------------------
+
+class _Parser:
+    def __init__(self, tokens: List[str]):
+        self.tokens = tokens
+        self.pos = 0
+
+    def peek(self) -> Optional[str]:
+        return self.tokens[self.pos] if self.pos < len(self.tokens) else None
+
+    def consume(self, expected: Optional[str] = None) -> str:
+        tok = self.peek()
+        if tok is None:
+            raise SyntaxError(f"Unexpected end of input (expected {expected!r})")
+        if expected is not None and tok != expected:
+            raise SyntaxError(f"Expected {expected!r} but got {tok!r}")
+        self.pos += 1
+        return tok
+
+    def parse_formula(self):
+        if self.peek() in ('forall', 'exists'):
+            return self._parse_quant()
+        return self._parse_implies()
+
+    def _parse_quant(self):
+        q   = self.consume()
+        var = self.consume()
+        self.consume('.')
+        body = self.parse_formula()
+        return Forall(var, body) if q == 'forall' else Exists(var, body)
+
+    def _parse_implies(self):
+        left = self._parse_or()
+        while self.peek() == '->':
+            self.consume('->')
+            right = self._parse_or()
+            left  = Implies(left, right)
+        return left
+
+    def _parse_or(self):
+        left = self._parse_and()
+        while self.peek() == '|':
+            self.consume('|')
+            right = self._parse_and()
+            left  = Or(left, right)
+        return left
+
+    def _parse_and(self):
+        left = self._parse_neg()
+        while self.peek() == '&':
+            self.consume('&')
+            right = self._parse_neg()
+            left  = And(left, right)
+        return left
+
+    def _parse_neg(self):
+        if self.peek() == '~':
+            self.consume('~')
+            return Not(self._parse_neg())
+        return self._parse_atom()
+
+    def _parse_atom(self):
+        tok = self.peek()
+
+        if tok == 'T':
+            self.consume()
+            return Top()
+
+        if tok == 'F':
+            self.consume()
+            return Bot()
+
+        if tok == '(':
+            self.consume('(')
+            f = self.parse_formula()
+            self.consume(')')
+            return f
+
+        name = self.consume()
+        if self.peek() == '(':
+            self.consume('(')
+            args = self._parse_termlist()
+            self.consume(')')
+            return Atom(name, args)
+        return Atom(name, [])
+
+    def _parse_termlist(self):
+        terms = [self._parse_term()]
+        while self.peek() == ',':
+            self.consume(',')
+            terms.append(self._parse_term())
+        return terms
+
+    def _parse_term(self):
+        name = self.consume()
+        if self.peek() == '(':
+            self.consume('(')
+            args = self._parse_termlist()
+            self.consume(')')
+            return Func(name, args)
+        return Var(name)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def parse(text: str):
+    """Parse a single FOL formula string and return an AST node."""
+    tokens = _tokenise(text.strip())
+    p      = _Parser(tokens)
+    ast    = p.parse_formula()
+    if p.peek() is not None:
+        raise SyntaxError(f"Unexpected token after formula: {p.peek()!r}")
+    return ast
+
+
+def parse_file(path: str) -> List:
+    """
+    Parse a plain-text file where each non-empty, non-comment line is one
+    FOL formula.  Returns a list of (line_number, raw_text, AST) triples.
+    """
+    results = []
+    with open(path, 'r') as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            try:
+                ast = parse(line)
+                results.append((lineno, line, ast))
+            except SyntaxError as e:
+                raise SyntaxError(f"Line {lineno}: {e}") from e
+    return results
+
+
+def parse_csv(path: str) -> List:
+    """
+    Parse a CSV file of test cases and return a list of
+    (row_number, formula_text, AST, expected, category, description) tuples.
+
+    Expected CSV format (header row required):
+        formula,expected,category,description
+
+        formula     - the FOL formula string (required)
+        expected    - 'true' or 'false' (optional; anything else -> None)
+        category    - free-text label e.g. 'propositional' / 'fol' (optional)
+        description - human-readable label for the test case (optional)
+
+    Rows where the formula cell is empty or starts with '#' are skipped.
+    The header row is always skipped.
+    """
+    import csv
+
+    results = []
+    with open(path, newline='', encoding='utf-8') as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            return results  # empty file
+
+        for rownum, row in enumerate(reader, start=2):  # row 1 = header
+            formula_text = row.get('formula', '').strip()
+            if not formula_text or formula_text.startswith('#'):
+                continue
+
+            raw_expected = row.get('expected', '').strip().lower()
+            if raw_expected == 'true':
+                expected = True
+            elif raw_expected == 'false':
+                expected = False
+            else:
+                expected = None
+
+            category    = row.get('category',    '').strip()
+            description = row.get('description', '').strip()
+
+            try:
+                ast = parse(formula_text)
+            except SyntaxError as e:
+                raise SyntaxError(
+                    f"CSV row {rownum} ('{formula_text}'): {e}"
+                ) from e
+
+            results.append((rownum, formula_text, ast, expected, category, description))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Quick self-test
+# ---------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    examples = [
+        "T",
+        "F",
+        "P(x)",
+        "~P(x)",
+        "P(x) & Q(y)",
+        "P(x) | Q(y)",
+        "P(x) -> Q(x)",
+        "~P(x) | Q(x)",
+        "(forall x. P(x)) -> Q(a)",
+        "(exists x. P(x)) & Q(b)",
+        "forall x. (exists y. R(x, y))",
+        "(P(x) & Q(x)) -> R(x)",
+        "forall x. (P(x) -> (Q(x) | R(x)))",
+    ]
+    print("=== Parser Self-Test ===\n")
+    for src in examples:
+        ast = parse(src)
+        print(f"  {src:<50}  =>  {ast!r}")
