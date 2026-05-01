@@ -1,0 +1,419 @@
+"""
+benchmark.py  -  Proof-Search Benchmarking Tool
+
+Runs one or more solver modules against a shared set of FOL formulae and
+produces a side-by-side comparison report showing:
+
+    Formula         - the formula being tested
+    Result          - PROVED / UNPROVED / TIMEOUT
+    Steps           - total rule-application calls made
+    Branches        - branching-rule (∧R / ∨L / →L) applications
+    Max Depth       - deepest point reached in the proof-search tree
+    Time (s)        - wall-clock seconds
+
+Usage
+-----
+1. Benchmark the baseline solver against the built-in test suite:
+
+       python benchmark.py
+
+2. Benchmark against a custom formula file (one formula per line):
+
+       python benchmark.py --file my_formulae.txt
+
+3. Compare baseline and improved solvers side-by-side:
+
+       python benchmark.py --solvers solver ImprovedSolver
+
+4. Full options:
+
+       python benchmark.py --help
+
+Formula file format
+-------------------
+One formula per line.  Lines starting with '#' are treated as comments.
+Each formula may optionally be followed by  # expected: true  or
+# expected: false  to enable automatic correctness checking.
+
+    P -> P                    # expected: true
+    P & ~P                    # expected: false
+    (P -> Q) -> (~Q -> ~P)    # expected: true
+"""
+
+import argparse
+import importlib
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from parser import parse
+
+
+# ---------------------------------------------------------------------------
+# Built-in benchmark suite
+# ---------------------------------------------------------------------------
+
+# Each entry is (formula_text, expected_result)
+# expected_result: True = provable, False = not provable, None = unknown
+BUILTIN_SUITE = [
+    # --- Propositional tautologies (should be PROVABLE) ---
+    ("P -> P",                                                      True),
+    ("T",                                                           True),
+    ("~F",                                                          True),
+    ("P | ~P",                                                      True),
+    ("(P & Q) -> P",                                                True),
+    ("(P & Q) -> Q",                                                True),
+    ("P -> (Q -> P)",                                               True),
+    ("(P -> Q) -> (~Q -> ~P)",                                      True),
+    ("((P -> F) -> F) -> P",                                        True),
+    ("(P -> (Q -> R)) -> ((P -> Q) -> (P -> R))",                   True),
+    ("(P & (Q | R)) -> ((P & Q) | (P & R))",                       True),
+    ("((P | Q) & ~P) -> Q",                                         True),
+    # --- Propositional non-tautologies (should be UNPROVABLE) ---
+    ("P",                                                           False),
+    ("P & ~P",                                                      False),
+    ("P & Q",                                                       False),
+    # --- Simple FOL (should be PROVABLE) ---
+    ("(forall x. P(x)) -> P(a)",                                    True),
+    ("P(a) -> (exists x. P(x))",                                    True),
+    ("(forall x. P(x)) -> (forall x. P(x))",                       True),
+    ("(forall x. (P(x) -> Q(x))) -> ((forall x. P(x)) -> (forall x. Q(x)))", True),
+    # --- Simple FOL (should be UNPROVABLE) ---
+    ("exists x. P(x)",                                              False),  # no witness
+    ("forall x. P(x)",                                              False),  # no evidence
+]
+
+
+# ---------------------------------------------------------------------------
+# Single result record
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BenchmarkResult:
+    formula:    str
+    expected:   Optional[bool]    # None = not specified
+    result:     Optional[bool]    # True/False/None(timeout)
+    steps:      int
+    branches:   int
+    max_depth:  int
+    elapsed:    float
+    timed_out:  bool
+
+    @property
+    def correct(self) -> Optional[bool]:
+        """True if result matches expectation, None if no expectation set."""
+        if self.expected is None:
+            return None
+        if self.timed_out:
+            return None          # can't verify on timeout
+        return self.result == self.expected
+
+    @property
+    def result_label(self) -> str:
+        if self.timed_out:
+            return "TIMEOUT"
+        return "PROVED" if self.result else "UNPROVED"
+
+
+# ---------------------------------------------------------------------------
+# Core benchmarking function
+# ---------------------------------------------------------------------------
+
+def run_benchmark(solver_module, suite: List) -> List[BenchmarkResult]:
+    """
+    Run every (formula_text, expected) pair in `suite` through solver_module.
+
+    solver_module must expose:
+        prove_with_metrics(formula) -> Metrics
+    where Metrics has: result, steps, branches, max_depth, timed_out.
+
+    Returns a list of BenchmarkResult objects.
+    """
+    results = []
+    for formula_text, expected in suite:
+        formula = parse(formula_text)
+
+        t0      = time.perf_counter()
+        metrics = solver_module.prove_with_metrics(formula)
+        elapsed = time.perf_counter() - t0
+
+        metrics.elapsed_sec = elapsed   # fill in the timing
+
+        results.append(BenchmarkResult(
+            formula   = formula_text,
+            expected  = expected,
+            result    = metrics.result,
+            steps     = metrics.steps,
+            branches  = metrics.branches,
+            max_depth = metrics.max_depth,
+            elapsed   = elapsed,
+            timed_out = metrics.timed_out,
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Report printing
+# ---------------------------------------------------------------------------
+
+_COL_FORMULA  = 55
+_COL_RESULT   =  9
+_COL_EXP      =  9
+_COL_OK       =  3
+_COL_STEPS    =  8
+_COL_BRANCHES =  8
+_COL_DEPTH    =  7
+_COL_TIME     =  9
+
+
+def _header_row() -> str:
+    return (
+        f"{'Formula':<{_COL_FORMULA}} "
+        f"{'Result':<{_COL_RESULT}} "
+        f"{'Expected':<{_COL_EXP}} "
+        f"{'OK':<{_COL_OK}} "
+        f"{'Steps':>{_COL_STEPS}} "
+        f"{'Branches':>{_COL_BRANCHES}} "
+        f"{'Depth':>{_COL_DEPTH}} "
+        f"{'Time(s)':>{_COL_TIME}}"
+    )
+
+
+def _data_row(r: BenchmarkResult) -> str:
+    formula_str  = r.formula if len(r.formula) <= _COL_FORMULA else r.formula[:_COL_FORMULA - 1] + "…"
+    expected_str = ("true" if r.expected else "false") if r.expected is not None else "?"
+    ok_str       = ("✓" if r.correct else "✗") if r.correct is not None else "-"
+    steps_str    = str(r.steps)    if not r.timed_out else "—"
+    branch_str   = str(r.branches) if not r.timed_out else "—"
+    depth_str    = str(r.max_depth) if not r.timed_out else "—"
+    time_str     = f"{r.elapsed:.5f}"
+
+    return (
+        f"{formula_str:<{_COL_FORMULA}} "
+        f"{r.result_label:<{_COL_RESULT}} "
+        f"{expected_str:<{_COL_EXP}} "
+        f"{ok_str:<{_COL_OK}} "
+        f"{steps_str:>{_COL_STEPS}} "
+        f"{branch_str:>{_COL_BRANCHES}} "
+        f"{depth_str:>{_COL_DEPTH}} "
+        f"{time_str:>{_COL_TIME}}"
+    )
+
+
+def _summary(results: List[BenchmarkResult]) -> dict:
+    proved    = sum(1 for r in results if r.result is True)
+    unproved  = sum(1 for r in results if r.result is False)
+    timeouts  = sum(1 for r in results if r.timed_out)
+    correct   = sum(1 for r in results if r.correct is True)
+    incorrect = sum(1 for r in results if r.correct is False)
+    total_steps    = sum(r.steps    for r in results if not r.timed_out)
+    total_branches = sum(r.branches for r in results if not r.timed_out)
+    total_time     = sum(r.elapsed  for r in results)
+    return dict(
+        proved=proved, unproved=unproved, timeouts=timeouts,
+        correct=correct, incorrect=incorrect,
+        total_steps=total_steps, total_branches=total_branches,
+        total_time=total_time, n=len(results),
+    )
+
+
+def print_report(solver_name: str, results: List[BenchmarkResult]) -> None:
+    sep  = "=" * (len(_header_row()))
+    sep2 = "-" * (len(_header_row()))
+
+    print(f"\n{sep}")
+    print(f"  Solver: {solver_name}")
+    print(f"{sep}")
+    print(_header_row())
+    print(sep2)
+
+    for r in results:
+        print(_data_row(r))
+
+    print(sep2)
+    s = _summary(results)
+    print(
+        f"  Totals: {s['n']} formulae | "
+        f"{s['proved']} proved | {s['unproved']} unproved | {s['timeouts']} timeout(s) | "
+        f"correct: {s['correct']} / {s['n'] - s['timeouts']}"
+    )
+    print(
+        f"          Steps: {s['total_steps']} | "
+        f"Branches: {s['total_branches']} | "
+        f"Total time: {s['total_time']:.5f}s"
+    )
+    print(sep)
+
+
+def print_comparison(names: List[str],
+                     all_results: List[List[BenchmarkResult]]) -> None:
+    """Print a compact side-by-side comparison of multiple solvers."""
+    assert len(names) == len(all_results)
+    n_solvers = len(names)
+    col_f = _COL_FORMULA
+
+    sep = "=" * (col_f + 2 + n_solvers * 42)
+    print(f"\n{sep}")
+    print("  SIDE-BY-SIDE COMPARISON")
+    print(sep)
+
+    # Header
+    header = f"{'Formula':<{col_f}}  "
+    for name in names:
+        header += f"{'[' + name + ']':<40}  "
+    print(header)
+    sub = " " * (col_f + 2)
+    for _ in names:
+        sub += f"{'Result':<9}{'Steps':>8}{'Branch':>8}{'Time(s)':>10}  "
+    print(sub)
+    print("-" * len(header))
+
+    formulae = [r.formula for r in all_results[0]]
+    for idx, formula in enumerate(formulae):
+        label = formula if len(formula) <= col_f else formula[:col_f - 1] + "…"
+        row   = f"{label:<{col_f}}  "
+        for solver_results in all_results:
+            r = solver_results[idx]
+            t = f"{r.elapsed:.5f}"
+            s = str(r.steps)    if not r.timed_out else "—"
+            b = str(r.branches) if not r.timed_out else "—"
+            row += f"{r.result_label:<9}{s:>8}{b:>8}{t:>10}  "
+        print(row)
+
+    print("-" * len(header))
+    print("  SUMMARY")
+    for name, results in zip(names, all_results):
+        s = _summary(results)
+        print(
+            f"  {name:<20} steps={s['total_steps']:<8} "
+            f"branches={s['total_branches']:<6} "
+            f"time={s['total_time']:.5f}s"
+        )
+    print(sep)
+
+
+# ---------------------------------------------------------------------------
+# Load suite from file
+# ---------------------------------------------------------------------------
+
+def load_suite_from_file(path: str) -> List:
+    """
+    Read a plain-text formula file.  Lines may end with  # expected: true/false
+    to set the expected result.  Plain '#' comment lines are skipped.
+    """
+    suite = []
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            expected = None
+            if '#' in line:
+                formula_part, comment = line.split('#', 1)
+                comment = comment.strip()
+                if comment.lower().startswith('expected:'):
+                    val = comment.split(':', 1)[1].strip().lower()
+                    if val == 'true':
+                        expected = True
+                    elif val == 'false':
+                        expected = False
+                line = formula_part.strip()
+            suite.append((line, expected))
+    return suite
+
+
+def load_suite_from_csv(path: str) -> List:
+    """
+    Read test cases from a CSV file using parser.parse_csv().
+
+    The CSV must have a 'formula' column.  The optional 'expected' column
+    should contain 'true' or 'false'.  Any extra columns (category,
+    description) are loaded but not used by the benchmarker directly.
+
+    Returns a list of (formula_text, expected) pairs — the same format
+    as load_suite_from_file() — so run_benchmark() works unchanged.
+    """
+    from parser import parse_csv
+    entries = parse_csv(path)
+    # entries: (rownum, formula_text, ast, expected, category, description)
+    return [(text, expected) for _, text, _, expected, _, _ in entries]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser_cli = argparse.ArgumentParser(
+        description="Benchmark FOL proof-search solvers.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser_cli.add_argument(
+        "--file", metavar="PATH",
+        help="Path to a formula file (one formula per line). "
+             "Defaults to the built-in test suite."
+    )
+    parser_cli.add_argument(
+        "--solvers", nargs="+", metavar="MODULE", default=["solver"],
+        help="Python module name(s) to benchmark (must expose "
+             "prove_with_metrics). Default: solver"
+    )
+    parser_cli.add_argument(
+        "--no-compare", action="store_true",
+        help="Print individual reports only; skip the side-by-side comparison."
+    )
+    args = parser_cli.parse_args()
+
+    # Load suite — prefer CSV over built-in, fall back gracefully
+    if args.file:
+        # Detect file type by extension
+        if args.file.lower().endswith('.csv'):
+            suite = load_suite_from_csv(args.file)
+            print(f"Loaded {len(suite)} formulae from CSV: {args.file}")
+        else:
+            suite = load_suite_from_file(args.file)
+            print(f"Loaded {len(suite)} formulae from: {args.file}")
+    else:
+        import os
+        default_csv = os.path.join(os.path.dirname(__file__), 'test_cases.csv')
+        if os.path.exists(default_csv):
+            suite = load_suite_from_csv(default_csv)
+            print(f"Loaded {len(suite)} formulae from default CSV: {default_csv}")
+        else:
+            suite = BUILTIN_SUITE
+            print(f"Using built-in test suite ({len(suite)} formulae)")
+
+    # Load solver modules
+    modules, loaded_names = [], []
+    for mod_name in args.solvers:
+        try:
+            mod = importlib.import_module(mod_name)
+            if not hasattr(mod, "prove_with_metrics"):
+                print(f"[ERROR] Module '{mod_name}' has no prove_with_metrics(). Skipping.")
+                continue
+            modules.append(mod)
+            loaded_names.append(mod_name)
+        except ModuleNotFoundError:
+            print(f"[ERROR] Module '{mod_name}' not found. Skipping.")
+
+    if not modules:
+        print("No valid solver modules loaded. Exiting.")
+        sys.exit(1)
+
+    # Run benchmarks
+    all_results = []
+    for mod, name in zip(modules, loaded_names):
+        results = run_benchmark(mod, suite)
+        all_results.append(results)
+        print_report(name, results)
+
+    # Side-by-side comparison (only makes sense with 2+ solvers)
+    if len(modules) >= 2 and not args.no_compare:
+        print_comparison(loaded_names, all_results)
+
+
+if __name__ == "__main__":
+    main()
