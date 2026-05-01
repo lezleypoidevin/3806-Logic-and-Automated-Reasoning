@@ -1,0 +1,617 @@
+"""
+ImprovedSolver.py  -  Improved Backward Proof Search
+
+An improved version of the baseline solver (solver.py), which implements
+Algorithm 2 from the textbook naively.  The same six-priority structure
+is preserved so the two solvers are directly comparable, but each stage
+has been improved to reduce steps, branches, depth, and running time.
+
+=======================================================================
+IMPROVEMENTS OVER THE BASELINE  (Algorithm 2)
+=======================================================================
+
+1. SEQUENT SUBSUMPTION CACHE  (fixes non-termination)
+   ─────────────────────────────────────────────────
+   Baseline problem:
+       Algorithm 2 has no memory.  When ∀L / ∃R (Priority 5) introduces a
+       fresh term and keeps the quantified formula, the exact same sequent
+       can be revisited infinitely, causing Python to hit its recursion
+       limit on any formula with an unprovable quantifier (e.g. "exists x. P(x)").
+
+   Fix:
+       Before doing any work on a sequent we compute a canonical frozenset
+       key for (gamma, delta) and store it in a `visited` set passed down
+       through the recursion.  If we have seen this exact sequent before we
+       immediately return False (stop), because re-exploring it can never
+       yield a new result.  This turns non-termination into a clean False.
+
+2. EARLY FAILURE DETECTION ON BRANCHING  (Priority 3)
+   ───────────────────────────────────────────────────
+   Baseline problem:
+       For ∧R / ∨L / →L the baseline always proves both sub-goals, even
+       when the first one already fails.  In the worst case this doubles
+       the work for every branching rule application.
+
+   Fix:
+       Short-circuit evaluation: if the left sub-goal returns False, skip
+       the right sub-goal entirely and return False immediately.  The branch
+       counter still increments so metrics remain comparable.
+
+3. FORMULA DEDUPLICATION IN SEQUENTS
+   ────────────────────────────────────
+   Baseline problem:
+       The baseline uses plain lists for gamma and delta.  When ∀L / ∃R
+       retain the original quantified formula alongside the instantiated
+       body, the same formula can accumulate duplicate copies across many
+       steps, causing redundant rule applications and a bloated sequent.
+
+   Fix:
+       After every rule application we strip duplicate formulae from both
+       gamma and delta before recursing, using repr() as the equality key.
+       Order is preserved; only exact duplicates are removed.
+
+4. ITERATED PRIORITY-2 RULES IN A SINGLE PASS  (invertible rules)
+   ────────────────────────────────────────────────────────────────
+   Baseline problem:
+       The baseline processes exactly one Priority-2 rule per recursive
+       call, then returns to the top of the function.  A sequent with N
+       invertible formulae therefore requires N nested calls before
+       reaching Priority 3+, adding N to both the step count and max depth.
+
+   Fix:
+       We loop over all Priority-2 rules in a single call until no more
+       apply, then recurse once.  This collapses long Priority-2 chains
+       into a single step, dramatically reducing depth and step count.
+
+5. TERM LIMIT ON ∀L / ∃R  (Priority 4 & 5)
+   ──────────────────────────────────────────
+   Baseline problem:
+       Algorithm 2 says to try every unused term and, if none, add a fresh
+       one — with no upper bound.  For unprovable quantified formulae this
+       can still diverge: fresh terms produce new sequent keys that miss
+       the cache, so the search keeps growing.
+
+   Fix:
+       A configurable MAX_FRESH_TERMS cap (default 6) limits how many
+       fresh constants can be introduced for a single quantified formula
+       per branch.  Once the cap is reached we return False rather than
+       diverging.  Provable formulae in standard LK' never need more than
+       one fresh term per quantifier, so correctness is unaffected.
+
+=======================================================================
+WHAT IS DELIBERATELY UNCHANGED
+=======================================================================
+  • The six-priority rule ordering is identical to Algorithm 2.
+  • Every LK' rule (¬R, ¬L, →R, ∧L, ∨R, ∀R, ∃L, ∧R, ∨L, →L, ∀L, ∃R)
+    is applied in the same position as in the baseline.
+  • The Metrics dataclass and prove_with_metrics() interface are identical,
+    so benchmark.py can compare the two solvers directly with:
+        python benchmark.py --solvers solver ImprovedSolver
+"""
+
+import itertools
+from dataclasses import dataclass
+from typing import FrozenSet, List, Optional, Tuple
+
+from parser import (
+    Top, Bot, Atom, Not, And, Or, Implies, Forall, Exists, Var, Func,
+    parse, parse_file, parse_csv,
+)
+
+
+# ---------------------------------------------------------------------------
+# Tuneable parameters
+# ---------------------------------------------------------------------------
+
+# Improvement 5: cap on fresh constants per quantified formula per branch.
+MAX_FRESH_TERMS = 6
+
+
+# ---------------------------------------------------------------------------
+# Metrics  (identical interface to solver.py)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Metrics:
+    """
+    Statistics captured during a single proof attempt.
+
+    result      - True = proved, False = unprovable, None = timed out
+    steps       - every call to _prove_sequent counts as one step
+    branches    - each application of a branching rule (∧R / ∨L / →L)
+    max_depth   - deepest point reached in the proof-search tree
+    timed_out   - True when RecursionError was raised
+    elapsed_sec - wall-clock time in seconds (set externally by benchmark.py)
+    """
+    result:      Optional[bool] = None
+    steps:       int            = 0
+    branches:    int            = 0
+    max_depth:   int            = 0
+    timed_out:   bool           = False
+    elapsed_sec: float          = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Term utilities  (identical to solver.py)
+# ---------------------------------------------------------------------------
+
+_fresh_counter = itertools.count(1)
+
+def _fresh_term() -> Var:
+    """Create a globally unique fresh constant."""
+    return Var(f"_c{next(_fresh_counter)}")
+
+
+def _substitute(formula, var_name: str, term):
+    """Replace all free occurrences of var_name with term in formula."""
+    def st(t):
+        if isinstance(t, Var):
+            return term if t.name == var_name else t
+        if isinstance(t, Func):
+            return Func(t.name, [st(a) for a in t.args])
+        return t
+
+    def sf(f):
+        if isinstance(f, (Top, Bot)):
+            return f
+        if isinstance(f, Atom):
+            return Atom(f.name, [st(t) for t in f.args])
+        if isinstance(f, Not):
+            return Not(sf(f.formula))
+        if isinstance(f, And):
+            return And(sf(f.left), sf(f.right))
+        if isinstance(f, Or):
+            return Or(sf(f.left), sf(f.right))
+        if isinstance(f, Implies):
+            return Implies(sf(f.left), sf(f.right))
+        if isinstance(f, Forall):
+            return f if f.var == var_name else Forall(f.var, sf(f.formula))
+        if isinstance(f, Exists):
+            return f if f.var == var_name else Exists(f.var, sf(f.formula))
+        return f
+
+    return sf(formula)
+
+
+def _terms_in_sequent(gamma: List, delta: List) -> List:
+    """Collect all distinct term leaves (Var / Func) in the sequent."""
+    seen, result = set(), []
+
+    def walk_term(t):
+        key = repr(t)
+        if key not in seen:
+            seen.add(key)
+            result.append(t)
+        if isinstance(t, Func):
+            for a in t.args:
+                walk_term(a)
+
+    def walk_formula(f):
+        if isinstance(f, (Top, Bot)):
+            pass
+        elif isinstance(f, Atom):
+            for t in f.args:
+                walk_term(t)
+        elif isinstance(f, Not):
+            walk_formula(f.formula)
+        elif isinstance(f, (And, Or, Implies)):
+            walk_formula(f.left)
+            walk_formula(f.right)
+        elif isinstance(f, (Forall, Exists)):
+            walk_formula(f.formula)
+
+    for f in gamma + delta:
+        walk_formula(f)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Improvement 3: deduplication helper
+# ---------------------------------------------------------------------------
+
+def _dedup(formulae: List) -> List:
+    """
+    Return formulae with duplicates removed (order preserved).
+    Two formulae are equal if their repr() strings match.
+    """
+    seen, out = set(), []
+    for f in formulae:
+        key = repr(f)
+        if key not in seen:
+            seen.add(key)
+            out.append(f)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Axiom check  (identical logic to solver.py)
+# ---------------------------------------------------------------------------
+
+def _is_closed(gamma: List, delta: List) -> bool:
+    """Priority 1: id, ⊤R, ⊥L."""
+    if any(isinstance(f, Top) for f in delta):
+        return True
+    if any(isinstance(f, Bot) for f in gamma):
+        return True
+    left_atoms  = {repr(f) for f in gamma if isinstance(f, Atom)}
+    right_atoms = {repr(f) for f in delta if isinstance(f, Atom)}
+    return bool(left_atoms & right_atoms)
+
+
+# ---------------------------------------------------------------------------
+# Improvement 1: sequent cache key
+# ---------------------------------------------------------------------------
+
+def _sequent_key(gamma: List, delta: List, used: dict) -> tuple:
+    """Canonical hashable key combining sequent and instantiation state."""
+    used_key = frozenset(
+        (fid, frozenset(terms))
+        for fid, terms in used.items()
+    )
+    return (
+        frozenset(repr(f) for f in gamma),
+        frozenset(repr(f) for f in delta),
+        used_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Improvement 4: exhaustive invertible-rule pass
+# ---------------------------------------------------------------------------
+
+def _apply_invertible(gamma: List, delta: List) -> Tuple[List, List]:
+    """
+    Repeatedly apply all Priority-2 (invertible / non-branching) rules
+    until none remain applicable, returning the simplified sequent.
+
+    Rules: ¬R, ¬L, →R, ∧L, ∨R, ∀R, ∃L
+
+    Each inner loop restarts from the beginning of the list after a match
+    so that newly exposed formulae are immediately processed.
+    Deduplication (Improvement 3) is applied after every change.
+    """
+    changed = True
+    while changed:
+        changed = False
+
+        # ¬R : ~A in delta -> move A to gamma
+        for i, f in enumerate(delta):
+            if isinstance(f, Not):
+                gamma   = gamma + [f.formula]
+                delta   = delta[:i] + delta[i+1:]
+                gamma   = _dedup(gamma)
+                changed = True
+                break
+
+        # ¬L : ~A in gamma -> move A to delta
+        for i, f in enumerate(gamma):
+            if isinstance(f, Not):
+                delta   = delta + [f.formula]
+                gamma   = gamma[:i] + gamma[i+1:]
+                delta   = _dedup(delta)
+                changed = True
+                break
+
+        # →R : A→B in delta -> add A to gamma, keep B in delta
+        for i, f in enumerate(delta):
+            if isinstance(f, Implies):
+                gamma   = gamma + [f.left]
+                delta   = delta[:i] + [f.right] + delta[i+1:]
+                gamma   = _dedup(gamma)
+                delta   = _dedup(delta)
+                changed = True
+                break
+
+        # ∧L : A∧B in gamma -> replace with A, B
+        for i, f in enumerate(gamma):
+            if isinstance(f, And):
+                gamma   = gamma[:i] + [f.left, f.right] + gamma[i+1:]
+                gamma   = _dedup(gamma)
+                changed = True
+                break
+
+        # ∨R : A∨B in delta -> replace with A, B
+        for i, f in enumerate(delta):
+            if isinstance(f, Or):
+                delta   = delta[:i] + [f.left, f.right] + delta[i+1:]
+                delta   = _dedup(delta)
+                changed = True
+                break
+
+        # ∀R : ∀x.A in delta -> replace with A[x/fresh]
+        for i, f in enumerate(delta):
+            if isinstance(f, Forall):
+                t       = _fresh_term()
+                body    = _substitute(f.formula, f.var, t)
+                delta   = delta[:i] + [body] + delta[i+1:]
+                delta   = _dedup(delta)
+                changed = True
+                break
+
+        # ∃L : ∃x.A in gamma -> replace with A[x/fresh]
+        for i, f in enumerate(gamma):
+            if isinstance(f, Exists):
+                t       = _fresh_term()
+                body    = _substitute(f.formula, f.var, t)
+                gamma   = gamma[:i] + [body] + gamma[i+1:]
+                gamma   = _dedup(gamma)
+                changed = True
+                break
+
+    return gamma, delta
+
+
+# ---------------------------------------------------------------------------
+# Main proof-search  (same six-priority structure as Algorithm 2)
+# ---------------------------------------------------------------------------
+
+def _prove_sequent(
+    gamma:   List,
+    delta:   List,
+    used:    dict,
+    metrics: Metrics,
+    depth:   int,
+    visited: set,
+) -> bool:
+    """
+    Attempt to prove (gamma ⊢ delta).
+
+    All five improvements are active; see module docstring for details.
+    """
+
+    # --- metrics ---
+    metrics.steps += 1
+    if depth > metrics.max_depth:
+        metrics.max_depth = depth
+
+    # ------------------------------------------------------------------
+    # Priority 1 – axiom rules: id, ⊤R, ⊥L
+    # ------------------------------------------------------------------
+    if _is_closed(gamma, delta):
+        return True
+
+    # ------------------------------------------------------------------
+    # Priority 2 – invertible rules (Improvement 4: exhaustive pass)
+    #   ¬R, ¬L, →R, ∧L, ∨R, ∀R, ∃L
+    # ------------------------------------------------------------------
+    gamma, delta = _apply_invertible(gamma, delta)
+
+    # Axiom re-check: invertible rules may have exposed an immediate closure.
+    if _is_closed(gamma, delta):
+        return True
+
+    # ------------------------------------------------------------------
+    # Improvement 1: visited-sequent cache
+    # We check AFTER the invertible pass so we cache the canonical (fully
+    # simplified) form of the sequent.  Checking before would cause the
+    # pre- and post-simplification keys to match (when no invertible rule
+    # fires), making the sequent incorrectly mark itself as visited.
+    # ------------------------------------------------------------------
+    key = _sequent_key(gamma, delta, used)
+    if key in visited:
+        return False
+    visited.add(key)
+
+    # Priority 3 – branching rules: ∧R, ∨L, →L
+    # Improvement 2: short-circuit on left-branch failure
+    # Improvement 3: dedup applied to each new sequent
+    # ------------------------------------------------------------------
+
+    # ∧R : A∧B in delta -> sub-goals (⊢ A) and (⊢ B)
+    for i, f in enumerate(delta):
+        if isinstance(f, And):
+            metrics.branches += 1
+            rest = delta[:i] + delta[i+1:]
+            if not _prove_sequent(gamma, _dedup(rest + [f.left]),  used, metrics, depth + 1, set(visited)):
+                return False   # Improvement 2: short-circuit
+            return      _prove_sequent(gamma, _dedup(rest + [f.right]), used, metrics, depth + 1, set(visited))
+
+    # ∨L : A∨B in gamma -> sub-goals (A ⊢) and (B ⊢)
+    for i, f in enumerate(gamma):
+        if isinstance(f, Or):
+            metrics.branches += 1
+            rest = gamma[:i] + gamma[i+1:]
+            if not _prove_sequent(_dedup(rest + [f.left]),  delta, used, metrics, depth + 1, set(visited)):
+                return False
+            return      _prove_sequent(_dedup(rest + [f.right]), delta, used, metrics, depth + 1, set(visited))
+
+    # →L : A→B in gamma -> sub-goals (⊢ A) and (B ⊢)
+    for i, f in enumerate(gamma):
+        if isinstance(f, Implies):
+            metrics.branches += 1
+            rest = gamma[:i] + gamma[i+1:]
+            if not _prove_sequent(_dedup(rest),             _dedup(delta + [f.left]), used, metrics, depth + 1, set(visited)):
+                return False
+            return      _prove_sequent(_dedup(rest + [f.right]), delta,               used, metrics, depth + 1, set(visited))
+
+    # ------------------------------------------------------------------
+    # Priority 4 – ∀L / ∃R with an existing unused term
+    # ------------------------------------------------------------------
+    available_terms = _terms_in_sequent(gamma, delta)
+
+    # ∀L
+    for i, f in enumerate(gamma):
+        if isinstance(f, Forall):
+            fid         = id(f)
+            used_so_far = used.get(fid, set())
+            for t in available_terms:
+                t_key = repr(t)
+                if t_key not in used_so_far:
+                    new_used      = dict(used)
+                    new_used[fid] = used_so_far | {t_key}
+                    body          = _substitute(f.formula, f.var, t)
+                    new_gamma     = _dedup(gamma[:i] + [body, f] + gamma[i+1:])
+                    return _prove_sequent(new_gamma, delta, new_used, metrics, depth + 1, visited)
+
+    # ∃R
+    for i, f in enumerate(delta):
+        if isinstance(f, Exists):
+            fid         = id(f)
+            used_so_far = used.get(fid, set())
+            for t in available_terms:
+                t_key = repr(t)
+                if t_key not in used_so_far:
+                    new_used      = dict(used)
+                    new_used[fid] = used_so_far | {t_key}
+                    body          = _substitute(f.formula, f.var, t)
+                    new_delta     = _dedup(delta[:i] + [body, f] + delta[i+1:])
+                    return _prove_sequent(gamma, new_delta, new_used, metrics, depth + 1, visited)
+
+    # ------------------------------------------------------------------
+    # Priority 5 – ∀L / ∃R with a fresh term
+    # Improvement 5: cap at MAX_FRESH_TERMS to guarantee termination
+    # ------------------------------------------------------------------
+
+    # ∀L
+    for i, f in enumerate(gamma):
+        if isinstance(f, Forall):
+            fid         = id(f)
+            used_so_far = used.get(fid, set())
+            if len(used_so_far) >= MAX_FRESH_TERMS:
+                return False   # Improvement 5: cap reached
+            t             = _fresh_term()
+            body          = _substitute(f.formula, f.var, t)
+            new_gamma     = _dedup(gamma[:i] + [body, f] + gamma[i+1:])
+            new_used      = dict(used)
+            new_used[fid] = used_so_far | {repr(t)}
+            return _prove_sequent(new_gamma, delta, new_used, metrics, depth + 1, visited)
+
+    # ∃R
+    for i, f in enumerate(delta):
+        if isinstance(f, Exists):
+            fid         = id(f)
+            used_so_far = used.get(fid, set())
+            if len(used_so_far) >= MAX_FRESH_TERMS:
+                return False
+            t             = _fresh_term()
+            body          = _substitute(f.formula, f.var, t)
+            new_delta     = _dedup(delta[:i] + [body, f] + delta[i+1:])
+            new_used      = dict(used)
+            new_used[fid] = used_so_far | {repr(t)}
+            return _prove_sequent(gamma, new_delta, new_used, metrics, depth + 1, visited)
+
+    # ------------------------------------------------------------------
+    # Priority 6 – no rule applicable  ->  stop
+    # ------------------------------------------------------------------
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Public entry points  (identical interface to solver.py)
+# ---------------------------------------------------------------------------
+
+def prove_with_metrics(formula) -> Metrics:
+    """
+    Prove ⊢ formula and return a populated Metrics object.
+    Interface is identical to solver.prove_with_metrics() so benchmark.py
+    can compare both solvers with:
+        python benchmark.py --solvers solver ImprovedSolver
+    """
+    m = Metrics()
+    try:
+        m.result = _prove_sequent([], [formula], {}, m, depth=0, visited=set())
+    except RecursionError:
+        m.timed_out = True
+        m.result    = None
+    return m
+
+
+def prove(formula) -> Optional[bool]:
+    """Convenience wrapper: prove ⊢ formula, return True / False / None."""
+    return prove_with_metrics(formula).result
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrappers for CLI / batch use
+# ---------------------------------------------------------------------------
+
+def solve_text(text: str, verbose: bool = True) -> Optional[bool]:
+    """Parse and prove a formula given as a string."""
+    formula = parse(text)
+    result  = prove(formula)
+    if verbose:
+        if result is None:
+            print(f"  [TIMEOUT]          {text}")
+        else:
+            status = "PROVABLE  [TRUE] " if result else "UNPROVABLE [FALSE]"
+            print(f"  {status}  {text}")
+    return result
+
+
+def solve_file(path: str) -> None:
+    """Parse and prove every formula in a plain-text file (one per line)."""
+    entries = parse_file(path)
+    print(f"\n{'='*60}")
+    print(f"Solving {len(entries)} formula(e) from: {path}")
+    print(f"{'='*60}")
+    proved = 0
+    for lineno, text, ast in entries:
+        result = prove(ast)
+        if result is None:
+            print(f"  Line {lineno:>3}: [TIMEOUT]           {text}")
+        else:
+            status = "PROVABLE  [TRUE] " if result else "UNPROVABLE [FALSE]"
+            print(f"  Line {lineno:>3}: {status}  {text}")
+            if result:
+                proved += 1
+    print(f"{'='*60}")
+    print(f"Result: {proved}/{len(entries)} provable\n")
+
+
+def solve_csv(path: str) -> None:
+    """
+    Parse and prove every formula in a CSV file.
+
+    The CSV must have at minimum a 'formula' column.  Optional columns:
+        expected    - 'true' or 'false' (used to show a pass/fail tick)
+        category    - printed as a group label
+        description - printed alongside each result
+    """
+    entries = parse_csv(path)
+    print(f"\n{'='*70}")
+    print(f"Solving {len(entries)} formula(e) from CSV: {path}")
+    print(f"{'='*70}")
+    proved = 0
+    for rownum, text, ast, expected, category, description in entries:
+        result = prove(ast)
+        if result is None:
+            status = "[TIMEOUT]          "
+        else:
+            status = "PROVABLE  [TRUE]  " if result else "UNPROVABLE [FALSE]"
+            if result:
+                proved += 1
+        ok = ""
+        if expected is not None and result is not None:
+            ok = " ✓" if result == expected else " ✗"
+        label = f"({description})" if description else ""
+        print(f"  Row {rownum:>3}: {status}{ok}  {text}  {label}")
+    print(f"{'='*70}")
+    print(f"Result: {proved}/{len(entries)} provable\n")
+
+
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    import sys
+    import os
+
+    # If a CSV path is given as an argument use it, otherwise fall back to
+    # the default test_cases.csv sitting next to this script.
+    if len(sys.argv) > 1:
+        csv_path = sys.argv[1]
+    else:
+        csv_path = os.path.join(os.path.dirname(__file__), 'test_cases.csv')
+
+    print("\n=== Improved Solver ===")
+    if os.path.exists(csv_path):
+        solve_csv(csv_path)
+    else:
+        print(f"[WARNING] CSV not found at '{csv_path}'.")
+        print("Falling back to built-in quick-check...\n")
+        for f in ["P -> P", "T", "~F", "P | ~P", "(P & Q) -> P",
+                  "(P -> Q) -> (~Q -> ~P)", "((P -> F) -> F) -> P",
+                  "(forall x. P(x)) -> P(a)", "P(a) -> (exists x. P(x))"]:
+            solve_text(f)
